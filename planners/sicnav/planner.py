@@ -75,12 +75,29 @@ _FAR: float = 1.0e3           # placement offset for padding humans
 # handing off to the MPC. SICNav's point-stabilisation MPC has a symmetric
 # zero-gradient equilibrium when the goal is ~180 deg behind the robot and stalls
 # there; this alignment step (cf. nav2's rotation shim) breaks that symmetry.
-# Set to 0 to disable and use the MPC unconditionally.
-_ALIGN_THRESHOLD: float = math.radians(100.0)
+# Rotate-to-face uses hysteresis: start turning when the heading error exceeds
+# _ALIGN_ENTER, and keep turning (no MPC) until it drops below _ALIGN_EXIT. This
+# prevents the align step and the MPC from fighting (which made the robot spin in
+# place): the robot turns cleanly to face the target, then the MPC drives.
+# Set _ALIGN_ENTER to 0 to disable and use the MPC unconditionally.
+_ALIGN_ENTER: float = math.radians(60.0)
+_ALIGN_EXIT: float = math.radians(15.0)
+# Proportional turn rate: correct the heading error over ~this many seconds
+# (clamped to _OMEGA_MAX). Larger = gentler; avoids the overshoot of err/dt.
+_ALIGN_TC: float = 0.5
+_aligning: bool = False
+# Goal the path_foll reference was last generated for (regenerate on change).
+_last_goal: tuple | None = None
 # Don't rotate-to-align when the target is closer than this: heading-to-target is
 # ill-defined on top of the goal, and spinning there stops the robot from settling
 # (and the task manager from registering arrival). Let the MPC settle instead.
 _ALIGN_MIN_DIST: float = 0.6
+# Final-approach pose control: SICNav's point-stabilisation reaches the goal
+# POSITION but not the goal HEADING. Arena's goto-pose completion check also
+# requires the goal yaw (default tol 30 deg) — so once within this position
+# distance of the goal, rotate in place to the goal yaw so arrival registers.
+_GOAL_POS_TOL: float = 0.5
+_GOAL_YAW_TOL: float = math.radians(12.0)
 
 _policy: CollisionAvoidMPC | None = None
 
@@ -187,35 +204,70 @@ def step(features: dict) -> list[float]:
     n_plan = 0 if gp is None else len(gp)
     _dbg(f"robot_pose={[round(float(v),3) for v in robot_pose[:3]]} n_plan={n_plan} n_peds={n_peds} goal_pose={features.get('goal_pose')}")
 
-    # Stabilisation point: lookahead along the global plan, else the goal pose.
-    target = None
+    theta = float(robot_pose[2])
+
+    # MPC goal: the actual goal pose. path_foll builds a straight-line reference
+    # from the robot to this goal and follows it (regenerated on goal change below).
+    goal = features.get("goal_pose")
     global_plan = features.get("global_plan")
-    if global_plan is not None and len(global_plan) > 0:
-        target = lookahead_on_path(np.asarray(global_plan), np.asarray(robot_pose), lookahead=_LOOKAHEAD)
-    if target is None:
-        goal_pose = features.get("goal_pose")
-        if goal_pose is not None and len(goal_pose) >= 2:
-            target = (float(goal_pose[0]), float(goal_pose[1]))
-    if target is None:
-        _dbg("no target -> [0,0]")
+    goal_xy: tuple[float, float] | None = None
+    if goal is not None and len(goal) >= 2:
+        goal_xy = (float(goal[0]), float(goal[1]))
+    elif global_plan is not None and len(global_plan) > 0:
+        gp_arr = np.asarray(global_plan)
+        goal_xy = (float(gp_arr[-1][0]), float(gp_arr[-1][1]))
+    if goal_xy is None:
+        _dbg("no goal -> [0,0]")
         return [0.0, 0.0]
 
-    # Unicycle alignment: if the target is far off the robot's heading, rotate in
-    # place toward it first (SICNav's point_stab MPC stalls at the ~180 deg
-    # equilibrium). Pure rotation, no translation, so it's safe around humans.
-    theta = float(robot_pose[2])
-    dist_to_target = math.hypot(target[0] - rx, target[1] - ry)
-    heading_err = (math.atan2(target[1] - ry, target[0] - rx) - theta + math.pi) % (2 * math.pi) - math.pi
-    if _ALIGN_THRESHOLD > 0.0 and dist_to_target > _ALIGN_MIN_DIST and abs(heading_err) > _ALIGN_THRESHOLD:
-        omega = float(np.clip(heading_err / _TIME_STEP, -_OMEGA_MAX, _OMEGA_MAX))
-        _dbg(f"align: heading_err={heading_err:.2f} -> rotate [0, {omega:.3f}]")
-        return [0.0, omega]
+    # Final-approach pose control: once within position tolerance of the goal, stop
+    # translating and rotate to the goal heading so the task manager's goto-pose
+    # check (position AND yaw) registers arrival (else explore never issues the
+    # next goal — SICNav reaches position but not heading).
+    if math.hypot(goal_xy[0] - rx, goal_xy[1] - ry) < _GOAL_POS_TOL:
+        if goal is not None and len(goal) >= 3:
+            yaw_err = (float(goal[2]) - theta + math.pi) % (2 * math.pi) - math.pi
+            if abs(yaw_err) > _GOAL_YAW_TOL:
+                omega = float(np.clip(yaw_err / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
+                _dbg(f"final-yaw: err={yaw_err:.2f} -> rotate [0, {omega:.3f}]")
+                return [0.0, omega]
+        _dbg("at goal pose -> [0,0]")
+        return [0.0, 0.0]
 
-    robot = _robot_full_state(robot_pose, robot_state, target)
+    # Unicycle alignment: rotate in place to face the goal before driving, so the
+    # MPC starts well-aligned. Hysteretic + proportional (turns cleanly then hands
+    # off). Pure rotation, no translation, so it's safe around humans.
+    global _aligning
+    heading_err = (math.atan2(goal_xy[1] - ry, goal_xy[0] - rx) - theta + math.pi) % (2 * math.pi) - math.pi
+    if _ALIGN_ENTER > 0.0:
+        if _aligning:
+            _aligning = abs(heading_err) > _ALIGN_EXIT
+        elif abs(heading_err) > _ALIGN_ENTER:
+            _aligning = True
+        if _aligning:
+            omega = float(np.clip(heading_err / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
+            _dbg(f"align: heading_err={heading_err:.2f} -> rotate [0, {omega:.3f}]")
+            return [0.0, omega]
+
+    robot = _robot_full_state(robot_pose, robot_state, goal_xy)
     humans = _human_states(features.get("pedestrians"), (rx, ry))
-    _dbg(f"target={[round(t,3) for t in target]} robot v=({round(robot.vx,3)},{round(robot.vy,3)}) "
-         f"closest_hum={[(round(h.px,2),round(h.py,2)) for h in humans[:3]]}")
     joint_state = FullyObservableJointState(self_state=robot, human_states=humans, static_obs=[])
+
+    # path_foll: (re)generate SICNav's reference whenever the goal changes. The
+    # first solve builds it inside init_mpc(); gen_ref_traj needs mpc_env, which
+    # only exists after that first predict().
+    global _last_goal
+    if getattr(_policy, "mpc_env", None) is not None and (
+        _last_goal is None or math.hypot(goal_xy[0] - _last_goal[0], goal_xy[1] - _last_goal[1]) > 0.2
+    ):
+        try:
+            _policy.gen_ref_traj(joint_state)
+            _dbg(f"regen ref -> goal {[round(g, 2) for g in goal_xy]}")
+        except Exception as exc:
+            _dbg(f"gen_ref_traj failed: {exc!r}")
+    _last_goal = goal_xy
+    _dbg(f"goal={[round(g, 2) for g in goal_xy]} robot v=({round(robot.vx, 3)},{round(robot.vy, 3)}) "
+         f"closest_hum={[(round(h.px, 2), round(h.py, 2)) for h in humans[:3]]}")
 
     try:
         action = _policy.predict(joint_state)
@@ -227,14 +279,18 @@ def step(features: dict) -> list[float]:
     # CAMPC returns ActionRot(v, omega*dt) for the unicycle base.
     v = float(np.clip(action.v, -_V_MAX, _V_MAX))
     omega = float(np.clip(action.r / _TIME_STEP, -_OMEGA_MAX, _OMEGA_MAX))
-    _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} -> [v={v:.4f}, omega={omega:.4f}]")
+    solved = _policy.mpc_sol_succ[-1] if getattr(_policy, "mpc_sol_succ", None) else "?"
+    dist_goal = math.hypot(goal_xy[0] - rx, goal_xy[1] - ry)
+    _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} solved={solved} dist_goal={dist_goal:.2f} -> [v={v:.4f}, omega={omega:.4f}]")
     return [v, omega]
 
 
 def on_reset(episode_id: str, initial_state: dict | None) -> None:
     # Rebuild the MPC for the next episode (re-fixes human count, resets warmstart).
-    global _policy
+    global _policy, _aligning, _last_goal
     _policy = None
+    _aligning = False
+    _last_goal = None
 
 
 if __name__ == "__main__":
