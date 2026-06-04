@@ -10,6 +10,8 @@ already exist via the Generator base class in data_sources.base).
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Callable
 from typing import Any
 
@@ -52,7 +54,14 @@ class Pipeline:
     def add(self, name: str, source: DataSource, qos: QoSProfile | int | None = None) -> None:
         if isinstance(source, Collector):
             self._collectors[name] = source
-            topic = source.topic if source.topic.startswith("/") or not self._ns else str(self._ns(source.topic))
+            if source.topic.startswith("/") or not self._ns:
+                topic = source.topic
+            else:
+                # Namespace() joins via os.path.join without resolving "..", so a
+                # parent-relative topic (e.g. "../arena_peds" to reach a node-level
+                # topic from a robot namespace) would stay literal and be rejected.
+                # normpath collapses ".." (and is a no-op for ordinary topics).
+                topic = os.path.normpath(str(self._ns(source.topic)))
             qos_value = qos if qos is not None else 10
             self._sub_handles.append(
                 self._node.create_subscription(source.message_type, topic, source.update, qos_value)
