@@ -71,6 +71,16 @@ _OMEGA_MAX: float = math.radians(60.0) / _TIME_STEP  # = max_rot_degrees / dt
 _LOOKAHEAD: float = 3.0       # path lookahead for the MPC stabilisation point
 _HUMAN_GOAL_PROJ: float = 2.0  # seconds of constant-velocity goal projection
 _FAR: float = 1.0e3           # placement offset for padding humans
+# Heading error (rad) beyond which we rotate in place toward the target before
+# handing off to the MPC. SICNav's point-stabilisation MPC has a symmetric
+# zero-gradient equilibrium when the goal is ~180 deg behind the robot and stalls
+# there; this alignment step (cf. nav2's rotation shim) breaks that symmetry.
+# Set to 0 to disable and use the MPC unconditionally.
+_ALIGN_THRESHOLD: float = math.radians(100.0)
+# Don't rotate-to-align when the target is closer than this: heading-to-target is
+# ill-defined on top of the goal, and spinning there stops the robot from settling
+# (and the task manager from registering arrival). Let the MPC settle instead.
+_ALIGN_MIN_DIST: float = 0.6
 
 _policy: CollisionAvoidMPC | None = None
 
@@ -189,6 +199,17 @@ def step(features: dict) -> list[float]:
     if target is None:
         _dbg("no target -> [0,0]")
         return [0.0, 0.0]
+
+    # Unicycle alignment: if the target is far off the robot's heading, rotate in
+    # place toward it first (SICNav's point_stab MPC stalls at the ~180 deg
+    # equilibrium). Pure rotation, no translation, so it's safe around humans.
+    theta = float(robot_pose[2])
+    dist_to_target = math.hypot(target[0] - rx, target[1] - ry)
+    heading_err = (math.atan2(target[1] - ry, target[0] - rx) - theta + math.pi) % (2 * math.pi) - math.pi
+    if _ALIGN_THRESHOLD > 0.0 and dist_to_target > _ALIGN_MIN_DIST and abs(heading_err) > _ALIGN_THRESHOLD:
+        omega = float(np.clip(heading_err / _TIME_STEP, -_OMEGA_MAX, _OMEGA_MAX))
+        _dbg(f"align: heading_err={heading_err:.2f} -> rotate [0, {omega:.3f}]")
+        return [0.0, omega]
 
     robot = _robot_full_state(robot_pose, robot_state, target)
     humans = _human_states(features.get("pedestrians"), (rx, ry))
