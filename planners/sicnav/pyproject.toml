@@ -1,0 +1,54 @@
+[project]
+name = "arena_planners_sicnav"
+version = "0.0.0"
+description = "SICNav (bilevel MPC crowd navigation) wrapper for the arena_planners bridge."
+# The arena_planners bridge SDK uses `@dataclass(slots=True)` (Python 3.10+), so
+# the planner venv must be >=3.10. SICNav's setup.py pins ==3.8.13, but that is
+# not a hard code requirement (all its deps ship 3.10 wheels); we relax it below
+# via tool.uv.dependency-metadata.
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "arena_planners",
+    "sicnav",
+    # solver + scientific stack (CasADi/IPOPT; no acados)
+    "casadi==3.6.5",
+    "numpy==1.24.4",
+    "scipy==1.10.1",
+    "pandas==2.0.3",
+    "matplotlib==3.7.5",
+    "torch==1.13.1",
+    # importing crowd_sim_plus registers its gym env, so gym is required at import.
+    # 0.23.1 (vs SICNav's 0.21.0 pin) has valid metadata and is import-compatible
+    # here — only `class CrowdSimPlus(gym.Env)` runs at import; gym.spaces calls are
+    # in env methods we never invoke (the controller only uses campc).
+    "gym==0.23.1",
+    "pyyaml",
+    # build tooling kept in the venv: needed to build gym (no isolation) and the
+    # Cython/CMake Python-RVO2 extension installed by CMakeLists.
+    "setuptools==65.5.0",
+    "wheel==0.38.0",
+    "cython==0.29.33",
+]
+
+[tool.uv]
+# gym 0.21.0 (and other sdist builds) only work against setuptools<66; constrain
+# the isolated build envs accordingly. (Wheels — torch, numpy, casadi, … — are
+# unaffected since they aren't built from source.)
+build-constraint-dependencies = ["setuptools<66", "wheel==0.38.0"]
+
+# Relax SICNav's ==3.8.13 pin so it installs on the 3.10 venv (code is compatible).
+[[tool.uv.dependency-metadata]]
+name = "sicnav"
+version = "0.0.1"
+requires-python = ">=3.8"
+requires-dist = []
+
+[tool.uv.sources]
+arena_planners = { git = "https://github.com/arena-planners/arena_planners.git", branch = "jazzy", subdirectory = "arena_planners" }
+# Original SICNav code (campc.py byte-identical to sepsamavi/safe-interactive-crowdnav);
+# this mirror's setup.py ships a complete packages list so it installs non-editable.
+sicnav = { git = "https://github.com/SugerSenpai/safe-interactive-crowdnav.git", rev = "4b3ed6f5ecf6045aa3c81bdb0e29dad68762ea47" }
+
+[tool.setuptools]
+packages = []
+py-modules = []
