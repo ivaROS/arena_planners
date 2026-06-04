@@ -1,0 +1,19 @@
+[project]
+name = "arena_planners_crowdnav"
+version = "0.0.0"
+description = "CrowdNav planner wrapper for the arena_planners bridge."
+requires-python = ">=3.10"
+dependencies = [
+    "arena_planners",
+    "torch>=1.9",
+    "numpy>=1.21,<2",
+    "gym>=0.21",
+    "scipy>=1.7",
+]
+
+[tool.uv.sources]
+arena_planners = { git = "https://github.com/arena-planners/arena_planners.git", branch = "jazzy", subdirectory = "arena_planners" }
+
+[tool.setuptools]
+packages = []
+py-modules = []

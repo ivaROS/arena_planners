@@ -2,7 +2,3 @@
 	path = planners/drlvo
 	url = https://github.com/arena-planners/drlvo.git
 	planner = drlvo
-[submodule "planners/crowdnav"]
-	path = planners/crowdnav
-	url = https://github.com/arena-planners/crowdnav.git
-	planner = crowdnav
