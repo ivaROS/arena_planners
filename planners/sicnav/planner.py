@@ -86,8 +86,9 @@ _ALIGN_EXIT: float = math.radians(15.0)
 # (clamped to _OMEGA_MAX). Larger = gentler; avoids the overshoot of err/dt.
 _ALIGN_TC: float = 0.5
 _aligning: bool = False
-# Goal the path_foll reference was last generated for (regenerate on change).
-_last_goal: tuple | None = None
+# Key identifying the reference last generated (goal + whether it follows the plan);
+# regenerate when it changes.
+_last_ref_key: tuple | None = None
 # Don't rotate-to-align when the target is closer than this: heading-to-target is
 # ill-defined on top of the goal, and spinning there stops the robot from settling
 # (and the task manager from registering arrival). Let the MPC settle instead.
@@ -186,6 +187,44 @@ def _human_states(peds, robot_xy) -> list[FullState]:
     return detected
 
 
+def _build_plan_reference(policy: CollisionAvoidMPC, joint_state, plan) -> bool:
+    """Set SICNav's reference (ref_poses_all/ref_actions_all) from the Arena global
+    plan so path_foll follows navfn's obstacle-avoiding route (instead of a
+    straight line). Returns True on success.
+
+    The plan is arc-length resampled to one MPC step of travel (pref_speed*dt) per
+    point; generate_traj() rolls the humans forward via ORCA to fill the rest of
+    the reference state. Requires mpc_env (i.e. after the first predict()).
+    """
+    mpc_env = getattr(policy, "mpc_env", None)
+    if mpc_env is None:
+        return False
+    pts = np.asarray(plan, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 2:
+        return False
+    pts = pts[:, :2]
+    dt = policy.time_step
+    spacing = max(mpc_env.pref_speed * dt, 0.05)
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(arc[-1])
+    if total < 1e-3:
+        return False
+    steps = max(2, int(np.ceil(total / spacing)))
+    samp = np.linspace(0.0, total, steps + 1)
+    rx = np.interp(samp, arc, pts[:, 0])
+    ry = np.interp(samp, arc, pts[:, 1])
+    rth = np.arctan2(np.gradient(ry), np.gradient(rx))
+    om = ((np.diff(rth) + np.pi) % (2 * np.pi) - np.pi) / dt          # (steps,)
+    v = np.full(steps, mpc_env.pref_speed)                            # (steps,)
+    x_rob = np.vstack([rx, ry, rth])                                  # (3, steps+1)
+    u_rob = np.vstack([v, om])                                        # (2, steps)
+    ref_x, ref_u = policy.generate_traj(joint_state, steps, x_rob=x_rob, u_rob=u_rob)
+    policy.ref_poses_all = ref_x
+    policy.ref_actions_all = ref_u
+    return True
+
+
 def step(features: dict) -> list[float]:
     global _policy
     if _policy is None:
@@ -253,19 +292,38 @@ def step(features: dict) -> list[float]:
     humans = _human_states(features.get("pedestrians"), (rx, ry))
     joint_state = FullyObservableJointState(self_state=robot, human_states=humans, static_obs=[])
 
-    # path_foll: (re)generate SICNav's reference whenever the goal changes. The
-    # first solve builds it inside init_mpc(); gen_ref_traj needs mpc_env, which
-    # only exists after that first predict().
-    global _last_goal
-    if getattr(_policy, "mpc_env", None) is not None and (
-        _last_goal is None or math.hypot(goal_xy[0] - _last_goal[0], goal_xy[1] - _last_goal[1]) > 0.2
-    ):
-        try:
-            _policy.gen_ref_traj(joint_state)
-            _dbg(f"regen ref -> goal {[round(g, 2) for g in goal_xy]}")
-        except Exception as exc:
-            _dbg(f"gen_ref_traj failed: {exc!r}")
-    _last_goal = goal_xy
+    # path_foll reference: prefer the Arena global plan (navfn's obstacle-avoiding
+    # route); fall back to SICNav's straight-line gen_ref_traj until a plan for the
+    # current goal is available. Rebuild only when the goal changes or the plan
+    # first becomes available (path_foll tracks the fixed reference via closest
+    # point as the robot advances). Needs mpc_env (after the first predict()).
+    global _last_ref_key
+    if getattr(_policy, "mpc_env", None) is not None:
+        plan_ok = (
+            global_plan is not None
+            and len(global_plan) >= 2
+            and math.hypot(
+                float(np.asarray(global_plan)[-1][0]) - goal_xy[0],
+                float(np.asarray(global_plan)[-1][1]) - goal_xy[1],
+            ) < 1.0
+        )
+        ref_key = (round(goal_xy[0], 1), round(goal_xy[1], 1), bool(plan_ok))
+        if ref_key != _last_ref_key:
+            built = False
+            if plan_ok:
+                try:
+                    built = _build_plan_reference(_policy, joint_state, global_plan)
+                except Exception as exc:
+                    _dbg(f"plan reference failed: {exc!r}")
+            if not built:
+                try:
+                    _policy.gen_ref_traj(joint_state)  # straight-line fallback
+                    built = True
+                except Exception as exc:
+                    _dbg(f"gen_ref_traj failed: {exc!r}")
+            if built:
+                _last_ref_key = ref_key
+                _dbg(f"regen ref -> goal {[round(g, 2) for g in goal_xy]} from_plan={plan_ok}")
     _dbg(f"goal={[round(g, 2) for g in goal_xy]} robot v=({round(robot.vx, 3)},{round(robot.vy, 3)}) "
          f"closest_hum={[(round(h.px, 2), round(h.py, 2)) for h in humans[:3]]}")
 
@@ -287,10 +345,10 @@ def step(features: dict) -> list[float]:
 
 def on_reset(episode_id: str, initial_state: dict | None) -> None:
     # Rebuild the MPC for the next episode (re-fixes human count, resets warmstart).
-    global _policy, _aligning, _last_goal
+    global _policy, _aligning, _last_ref_key
     _policy = None
     _aligning = False
-    _last_goal = None
+    _last_ref_key = None
 
 
 if __name__ == "__main__":
