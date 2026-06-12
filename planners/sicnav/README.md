@@ -65,13 +65,67 @@ arena launch sim:=gazebo world:=map_empty robot:=jackal \
   has no `pyproject.toml`, imports Cython in `setup.py`, and builds a bundled C++
   lib via CMake, so it needs `--no-build-isolation` against the venv.
 
-## Performance
+## Performance & HSL/MA57
 
-Solve time grows steeply with the human count on IPOPT/MUMPS (no HSL):
-~0.4 s @2 humans, ~1.1 s @3, ~8 s @5. `_MAX_HUMANS` in `planner.py` defaults to
-**3** (the closest pedestrians; padded with far/inactive humans when fewer). For
-real-time multi-human navigation install **HSL/MA57** — `campc.py` auto-detects it
-when the HSL libs are on the library path (free for academics via Coin-HSL).
+SICNav's bilevel ORCA-KKT MPC is solved by IPOPT, and the linear solver dominates
+the per-step cost. `_MAX_HUMANS` in `planner.py` caps how many pedestrians enter
+the MPC (the closest ones; padded with far/inactive humans when fewer are seen).
+The MPC step period is 0.25 s. Measured solve time per step:
+
+| humans | IPOPT/MUMPS (default) | IPOPT/MA57 (HSL) |
+|-------:|----------------------:|-----------------:|
+|      2 | ~0.4 s                | ~0.19 s          |
+|      3 | ~1.1 s                | ~0.26 s          |
+|      4 | —                     | ~0.40 s          |
+|      5 | ~8 s                  | ~0.50 s          |
+|      6 | —                     | ~0.69 s          |
+
+Without HSL, only ~3 humans is workable; 5 is effectively unusable (~8 s/step).
+With **HSL/MA57** the solve is ~16× faster at 5 humans, so `_MAX_HUMANS` defaults
+to **5** (the original SICNav crowd operating point, ~2 Hz). `campc.py`
+auto-detects MA57 at startup and uses it whenever the HSL library is on the
+planner venv's library path. Drop `_MAX_HUMANS` back to 3 for the tightest
+(~4 Hz) control rate, or if you run without HSL.
+
+### Installing HSL/MA57
+
+HSL (Coin-HSL) is free for academics but distributed under a **per-user licence**,
+so it **cannot be committed to this repo or shared between collaborators** — every
+person who wants MA57 obtains their own licence and supplies their own source
+tarball. The steps below take a collaborator from "no licence" to a working MA57
+build. `scripts/install_hsl.sh` automates everything after the download.
+
+1. **Apply for the licence.** Go to <https://licences.stfc.ac.uk/product/coin-hsl>,
+   create an account with your **academic/institutional email**, and request the
+   **Coin-HSL** package (the full one — it includes MA57 — *not* the smaller
+   "Coin-HSL Archive"). Approval is manual and usually lands by email within a day
+   or two. You only need to do this once.
+2. **Download the source** once approved. From your STFC account, download the
+   Coin-HSL **source tarball** (e.g. `coinhsl-2024.05.15.tar.gz`). Put it somewhere
+   the Arena container can read — the installer searches `~/arena_ws/hsl/` and
+   `<workspace>/build/hsl_build/` by default, or you can pass an explicit path.
+3. **Build the SICNav planner first** (`arena build arena_planners_sicnav`) so its
+   venv exists for the installer to wire HSL into.
+4. **Run the installer inside the Arena container**, pointing it at your tarball:
+   ```sh
+   docker exec -u 0 <arena-container> bash -lc \
+     'bash /opt/arena_ws/src/Arena/arena_planners/planners/sicnav/scripts/install_hsl.sh \
+      /opt/arena_ws/build/hsl_build/coinhsl-2024.05.15.tar.gz'
+   ```
+   (find `<arena-container>` with `docker ps`; it's typically `arena-<workspace>-arena-1`).
+   The script installs build deps (gfortran, meson, ninja, libmetis-dev), compiles
+   `libcoinhsl.so`, and installs a self-contained `libhsl.so` (with `libmetis.so.5`
+   bundled and `RPATH=$ORIGIN`) into the venv's `casadi/` package dir — which is
+   where IPOPT's `dlopen("libhsl.so")` looks (its `libipopt.so` has `RPATH=$ORIGIN`).
+   It verifies MA57 actually loads (`>>> SUCCESS: IPOPT loaded MA57`) before exiting.
+5. **Done.** Nothing else to configure — `campc.py` auto-detects MA57 on the next
+   run. You can confirm it in the planner logs: `[CAMPC] MA57 linear solver
+   available, using it`.
+
+Re-run the installer (step 4) after any clean rebuild of the SICNav venv — a venv
+rebuild reinstalls `casadi` and removes the bundled `libhsl.so`. Collaborators
+*without* an HSL licence don't need to do anything: SICNav runs on the default
+MUMPS solver (keep `_MAX_HUMANS` at 3 in `planner.py`).
 
 ## Debugging
 

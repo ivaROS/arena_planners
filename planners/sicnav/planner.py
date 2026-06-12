@@ -58,11 +58,15 @@ _TIME_STEP: float = 0.25
 # present exactly this many humans: the closest detected pedestrians, padded with
 # far-away inactive humans when fewer are seen.
 #
-# Solve time grows steeply with this (IPOPT/MUMPS, no HSL): ~0.4s @2, ~1.1s @3,
-# ~8s @5. Original SICNav reaches real-time with the HSL/MA57 linear solver; until
-# that's installed, keep this small. campc.py auto-detects MA57 and uses it if the
-# HSL libs are on the library path.
-_MAX_HUMANS: int = 3
+# Solve time grows steeply with this. The MPC step period is _TIME_STEP (0.25s).
+# On the IPOPT/MUMPS default (no HSL) the bilevel ORCA-KKT solve is ~0.4s @2,
+# ~1.1s @3, ~8s @5 — only ~3 humans is workable, 5 is unusable.
+# With HSL/MA57 installed (scripts/install_hsl.sh) measured solve times are
+# ~0.19s @2, ~0.26s @3, ~0.40s @4, ~0.50s @5, ~0.69s @6 — i.e. ~16x faster at 5,
+# enough to run 5 humans at ~2Hz (the original SICNav crowd operating point).
+# campc.py auto-detects MA57 and uses it when the HSL lib is on the library path.
+# Drop this to 3 (near 4Hz) for the tightest control rate, or if running WITHOUT HSL.
+_MAX_HUMANS: int = 5
 _ROBOT_RADIUS: float = 0.3
 _HUMAN_RADIUS: float = 0.3
 _V_PREF: float = 0.9          # = pref_speed in policy.config
