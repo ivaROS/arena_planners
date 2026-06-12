@@ -12,7 +12,10 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-arena_planners = { git = "https://github.com/arena-planners/arena_planners.git", branch = "jazzy", subdirectory = "arena_planners" }
+# Pin to OUR ivaROS fork at the exact submodule commit (2-endpoint bridge), NOT
+# upstream's moving `jazzy` branch, so the planner-venv bridge protocol stays
+# identical to the host edge_node. Bump `rev` to the submodule HEAD when advanced.
+arena_planners = { git = "https://github.com/ivaROS/arena_planners.git", rev = "a3a491ac297a7f0bd7e812c6adf2c37d1e497297", subdirectory = "arena_planners" }
 
 [tool.setuptools]
 packages = []

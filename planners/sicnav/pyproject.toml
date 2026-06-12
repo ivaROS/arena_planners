@@ -44,7 +44,11 @@ requires-python = ">=3.8"
 requires-dist = []
 
 [tool.uv.sources]
-arena_planners = { git = "https://github.com/arena-planners/arena_planners.git", branch = "jazzy", subdirectory = "arena_planners" }
+# Pin to OUR ivaROS fork at the exact submodule commit (2-endpoint bridge), NOT
+# upstream's moving `jazzy` branch — keeps the bridge protocol identical to the host
+# edge_node and installs the SDK deps (pyzmq/msgpack) via git+subdirectory. Bump
+# `rev` to the new submodule HEAD whenever arena_planners is advanced.
+arena_planners = { git = "https://github.com/ivaROS/arena_planners.git", rev = "a3a491ac297a7f0bd7e812c6adf2c37d1e497297", subdirectory = "arena_planners" }
 # Original SICNav code (campc.py byte-identical to sepsamavi/safe-interactive-crowdnav);
 # this mirror's setup.py ships a complete packages list so it installs non-editable.
 sicnav = { git = "https://github.com/SugerSenpai/safe-interactive-crowdnav.git", rev = "4b3ed6f5ecf6045aa3c81bdb0e29dad68762ea47" }
