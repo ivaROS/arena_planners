@@ -132,3 +132,22 @@ MUMPS solver (keep `_MAX_HUMANS` at 3 in `planner.py`).
 Set `SICNAV_DEBUG=/path/to/log` in the launch environment to have `planner.py`
 append per-step inputs (robot pose, plan length, pedestrian count, goal) and the
 chosen action to that file (the bridge consumes the subprocess stdout/stderr).
+
+## Troubleshooting
+
+**`ModuleNotFoundError: No module named 'msgpack'` / `'zmq'`** (in
+`task_generator_node` / `arena_planners.bridge.edge_node` at launch). The bridge
+*host* node runs in the main workspace venv (`/opt/venv`), and these are declared
+deps of the bridge (`arena_planners/pyproject.toml`: `pyzmq`, `msgpack`,
+`msgpack-numpy`). The error means that venv is **stale** — it predates those deps
+and hasn't been re-synced. This affects *all* bridge planners (drlvo, crowdnav,
+sicnav), not just SICNav. Fix by re-syncing the workspace venv:
+
+```sh
+arena pull      # runs `uv sync` for you, or directly inside the container:
+cd /opt/arena_ws/src/Arena && UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --inexact --project .
+```
+
+A fresh `install.sh` and every `arena pull` already run this sync, so collaborators
+on the normal flow get the deps automatically; this only bites a long-lived venv
+that skipped a sync after the deps were added upstream.
