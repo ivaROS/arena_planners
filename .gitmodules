@@ -1,4 +1,4 @@
 [submodule "planners/drlvo"]
 	path = planners/drlvo
-	url = https://github.com/arena-planners/drlvo.git
+	url = https://github.com/noir-kalakaar/drlvo.git
 	planner = drlvo
