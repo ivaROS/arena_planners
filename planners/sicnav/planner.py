@@ -369,8 +369,18 @@ def step(features: dict) -> list[float]:
     v = float(np.clip(action.v, -_V_MAX, _V_MAX))
     omega = float(np.clip(action.r / _TIME_STEP, -_OMEGA_MAX, _OMEGA_MAX))
     solved = _policy.mpc_sol_succ[-1] if getattr(_policy, "mpc_sol_succ", None) else "?"
+    # Solver diagnostics: campc reports solved=True even when it DISCARDS the solve
+    # and returns the warmstart guess (final_obj > init_obj) or hits an iter/time
+    # limit. status (2=Succeeded, 1=Acceptable, -2=MaxIter), iter_count, and the
+    # debug_text ("Solution worse than warmstart" / "USING WARMSTART GUESS") tell us
+    # which — key to diagnosing the conservative cruise speed.
+    _ss = getattr(_policy, "solver_summary", None)
+    status = _ss["optim_status"][-1] if _ss and _ss.get("optim_status") else "?"
+    iters = _ss["iter_count"][-1] if _ss and _ss.get("iter_count") else "?"
+    dtext = _policy.all_debug_text[-1] if getattr(_policy, "all_debug_text", None) else "?"
     dist_goal = math.hypot(goal_xy[0] - rx, goal_xy[1] - ry)
-    _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} solved={solved} solve_s={solve_s:.3f} dist_goal={dist_goal:.2f} -> [v={v:.4f}, omega={omega:.4f}]")
+    _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} solved={solved} status={status} iters={iters} "
+         f"why={dtext!r} solve_s={solve_s:.3f} dist_goal={dist_goal:.2f} -> [v={v:.4f}, omega={omega:.4f}]")
     return [v, omega]
 
 

@@ -45,6 +45,22 @@ add_custom_command(
 )
 add_custom_target(CAMPC_PATCH ALL DEPENDS "${_campc_stamp}" "${target_venv}")
 
+# Upstream SICNav weights only x/y position in the MPC cost (Q index 3, the robot
+# velocity state, is 0), so the non-convex bilevel solve settles into a slow
+# warmstart local minimum and the robot crawls (~0.35 m/s) instead of cruising at
+# pref_speed. Re-apply the one-line Q weight on every build. Idempotent; see scripts/.
+set(_speed_patch "${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_mpc_speed.py")
+set(_speed_stamp "${CMAKE_CURRENT_BINARY_DIR}/mpc_speed_patched.installed")
+add_custom_command(
+  OUTPUT "${_speed_stamp}"
+  DEPENDS "${venv_dir}" "${_speed_patch}"
+  COMMAND "${venv_python_bin}" "${_speed_patch}"
+  COMMAND ${CMAKE_COMMAND} -E touch "${_speed_stamp}"
+  COMMENT "Patching SICNav mpc_env.py to track pref_speed (cruise-speed fix)"
+  VERBATIM
+)
+add_custom_target(MPC_SPEED_PATCH ALL DEPENDS "${_speed_stamp}" "${target_venv}")
+
 install(
   FILES
     planner.py
