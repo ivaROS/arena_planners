@@ -159,7 +159,12 @@ class PlannerEdgeNode(ArenaMixinNode):
         self._seq: int = 0
 
         self._rate = self.ROSParam[float]("planner_rate_hz", 10.0)
-        self._action_timeout = self.ROSParam[float]("planner_action_timeout_s", 0.5)
+        # Default raised 0.5 -> 0.8: a converged 5-human SICNav bilevel solve
+        # legitimately takes ~0.52s (IPOPT ~0.37 + ~0.15 build/warmstart overhead),
+        # so a 0.5s timeout dropped nearly every action to a held cmd_vel one poll
+        # late. 0.8 lets the solved action publish immediately for clean 2Hz control.
+        # Harmless for fast NN planners (drlvo/crowdnav) whose solves are << 0.5s.
+        self._action_timeout = self.ROSParam[float]("planner_action_timeout_s", 0.8)
         self._init_timeout = self.ROSParam[float]("planner_init_timeout_s", 60.0)
         self._dropped_features_logged: set[str] = set()
 

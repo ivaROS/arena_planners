@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import pathlib
+import time
 
 import numpy as np
 from arena_planners.geometry import lookahead_on_path
@@ -53,19 +54,31 @@ def _dbg(msg: str) -> None:
         pass
 
 # Must match the dynamics assumptions baked into configs/policy.config.
-_TIME_STEP: float = 0.25
+# MPC integration step. CRUCIAL real-time constraint: with obs_policy=latest_only
+# the bridge feeds the planner the freshest observation and the planner solves
+# back-to-back, so the effective control period == the solve time, and each MPC
+# action is held until the next solve completes. For the plan to be consistent,
+# _TIME_STEP must match that achievable solve time. At 5 humans the MA57 solve is
+# ~0.5s, so _TIME_STEP=0.5 (2Hz) — SICNav's documented crowd operating point.
+# (At 0.25s/4Hz the action was applied ~2x its planned duration -> oversteer +
+# crawl.) The policy.config dynamics limits (max_speed, max_rot, max_l_acc, ...)
+# are physical rates/accelerations that the MPC multiplies by _TIME_STEP itself,
+# so they need NO rescaling when _TIME_STEP changes. Drop to 0.25 only alongside
+# _MAX_HUMANS<=3 (solve ~0.26s) for 4Hz reactive control with a smaller crowd.
+_TIME_STEP: float = 0.50
 # The MPC is built for a fixed human count (set on the first solve). We always
 # present exactly this many humans: the closest detected pedestrians, padded with
 # far-away inactive humans when fewer are seen.
 #
-# Solve time grows steeply with this. The MPC step period is _TIME_STEP (0.25s).
-# On the IPOPT/MUMPS default (no HSL) the bilevel ORCA-KKT solve is ~0.4s @2,
-# ~1.1s @3, ~8s @5 — only ~3 humans is workable, 5 is unusable.
-# With HSL/MA57 installed (scripts/install_hsl.sh) measured solve times are
-# ~0.19s @2, ~0.26s @3, ~0.40s @4, ~0.50s @5, ~0.69s @6 — i.e. ~16x faster at 5,
-# enough to run 5 humans at ~2Hz (the original SICNav crowd operating point).
-# campc.py auto-detects MA57 and uses it when the HSL lib is on the library path.
-# Drop this to 3 (near 4Hz) for the tightest control rate, or if running WITHOUT HSL.
+# Solve time grows steeply with this. On IPOPT/MUMPS (no HSL) the bilevel ORCA-KKT
+# solve is ~0.4s @2, ~1.1s @3, ~8s @5 — 5 is unusable. With HSL/MA57
+# (scripts/install_hsl.sh): ~0.19s @2, ~0.26s @3, ~0.40s @4, ~0.50s @5, ~0.69s @6.
+# 5 = SICNav's crowd operating point, run at _TIME_STEP=0.5 (2Hz) so the ~0.5s
+# solve matches the control period. campc.py caps the IPOPT wall-clock
+# (ipopt.max_cpu_time) so the occasional hard solve can't spike to multiple
+# seconds and make the robot drive blind. At _TIME_STEP=0.5 the per-step travel is
+# pref_speed*dt=0.45m, so horiz=4 already gives 1.8m lookahead (more than horiz=6
+# did at 0.25s) — no need for a long horizon. campc.py auto-detects MA57.
 _MAX_HUMANS: int = 5
 _ROBOT_RADIUS: float = 0.3
 _HUMAN_RADIUS: float = 0.3
@@ -218,7 +231,19 @@ def _build_plan_reference(policy: CollisionAvoidMPC, joint_state, plan) -> bool:
     samp = np.linspace(0.0, total, steps + 1)
     rx = np.interp(samp, arc, pts[:, 0])
     ry = np.interp(samp, arc, pts[:, 1])
-    rth = np.arctan2(np.gradient(ry), np.gradient(rx))
+    # Heading from a windowed finite difference along the path, NOT an adjacent-point
+    # np.gradient. The global plan is finely sampled and grid-quantised (navfn emits
+    # hundreds of points with cm-scale staircase jitter), so adjacent differences give
+    # a heading that zig-zags +-45deg; the MPC then tracks that as a +-1 rad/s heading
+    # wiggle (and never builds forward speed). A multi-point window low-passes the
+    # orientation while keeping the tracked positions exactly on the planned,
+    # obstacle-avoiding route. ~0.5 m window.
+    n = len(rx)
+    L = max(1, int(round(0.5 / spacing)))
+    idx = np.arange(n)
+    ahead = np.minimum(idx + L, n - 1)
+    behind = np.maximum(idx - L, 0)
+    rth = np.unwrap(np.arctan2(ry[ahead] - ry[behind], rx[ahead] - rx[behind]))
     om = ((np.diff(rth) + np.pi) % (2 * np.pi) - np.pi) / dt          # (steps,)
     v = np.full(steps, mpc_env.pref_speed)                            # (steps,)
     x_rob = np.vstack([rx, ry, rth])                                  # (3, steps+1)
@@ -332,7 +357,9 @@ def step(features: dict) -> list[float]:
          f"closest_hum={[(round(h.px, 2), round(h.py, 2)) for h in humans[:3]]}")
 
     try:
+        t_solve = time.perf_counter()
         action = _policy.predict(joint_state)
+        solve_s = time.perf_counter() - t_solve
     except Exception as exc:  # solver/parse failure -> stop safely
         _log.warning("SICNav predict failed: %s", exc)
         _dbg(f"PREDICT EXCEPTION: {exc!r}")
@@ -343,7 +370,7 @@ def step(features: dict) -> list[float]:
     omega = float(np.clip(action.r / _TIME_STEP, -_OMEGA_MAX, _OMEGA_MAX))
     solved = _policy.mpc_sol_succ[-1] if getattr(_policy, "mpc_sol_succ", None) else "?"
     dist_goal = math.hypot(goal_xy[0] - rx, goal_xy[1] - ry)
-    _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} solved={solved} dist_goal={dist_goal:.2f} -> [v={v:.4f}, omega={omega:.4f}]")
+    _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} solved={solved} solve_s={solve_s:.3f} dist_goal={dist_goal:.2f} -> [v={v:.4f}, omega={omega:.4f}]")
     return [v, omega]
 
 

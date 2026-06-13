@@ -29,6 +29,22 @@ add_custom_command(
 )
 add_custom_target(RVO2_INSTALL ALL DEPENDS "${_rvo2_stamp}" "${target_venv}")
 
+# The upstream (third-party) SICNav campc.py builds its IPOPT solver without an
+# ipopt.max_cpu_time bound, so a hard bilevel solve can run for seconds and the
+# robot drives blind. We don't own that fork, so re-apply the one-line solver-time
+# bound to the venv copy on every (re)build. Idempotent; see scripts/.
+set(_campc_patch "${CMAKE_CURRENT_SOURCE_DIR}/scripts/patch_campc_solver.py")
+set(_campc_stamp "${CMAKE_CURRENT_BINARY_DIR}/campc_patched.installed")
+add_custom_command(
+  OUTPUT "${_campc_stamp}"
+  DEPENDS "${venv_dir}" "${_campc_patch}"
+  COMMAND "${venv_python_bin}" "${_campc_patch}"
+  COMMAND ${CMAKE_COMMAND} -E touch "${_campc_stamp}"
+  COMMENT "Patching SICNav campc.py with ipopt.max_cpu_time bound (solver safety)"
+  VERBATIM
+)
+add_custom_target(CAMPC_PATCH ALL DEPENDS "${_campc_stamp}" "${target_venv}")
+
 install(
   FILES
     planner.py
