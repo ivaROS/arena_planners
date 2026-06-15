@@ -58,14 +58,16 @@ def _dbg(msg: str) -> None:
 # the bridge feeds the planner the freshest observation and the planner solves
 # back-to-back, so the effective control period == the solve time, and each MPC
 # action is held until the next solve completes. For the plan to be consistent,
-# _TIME_STEP must match that achievable solve time. At 5 humans the MA57 solve is
-# ~0.5s, so _TIME_STEP=0.5 (2Hz) — SICNav's documented crowd operating point.
-# (At 0.25s/4Hz the action was applied ~2x its planned duration -> oversteer +
-# crawl.) The policy.config dynamics limits (max_speed, max_rot, max_l_acc, ...)
-# are physical rates/accelerations that the MPC multiplies by _TIME_STEP itself,
-# so they need NO rescaling when _TIME_STEP changes. Drop to 0.25 only alongside
-# _MAX_HUMANS<=3 (solve ~0.26s) for 4Hz reactive control with a smaller crowd.
-_TIME_STEP: float = 0.50
+# _TIME_STEP must match that achievable solve time. At _MAX_HUMANS=3 the MA57 solve
+# is ~0.26s, so _TIME_STEP=0.25 (4Hz) keeps the held action close to its planned
+# duration. (5 humans @0.5s/2Hz was the nominal crowd point, but the ~0.5-0.6s solve
+# blew the CPU cap ~99% of the time at the crossing -> MPC starved -> stall; see
+# _MAX_HUMANS.) Earlier 0.25 attempts oversteered because they ran 5 humans (solve
+# ~0.5s >> 0.25s step, action held ~2x); paired with _MAX_HUMANS=3 the solve now
+# matches the step. The policy.config dynamics limits (max_speed, max_rot,
+# max_l_acc, ...) are physical rates/accelerations the MPC multiplies by _TIME_STEP
+# itself, so they need NO rescaling here; _OMEGA_MAX below tracks _TIME_STEP.
+_TIME_STEP: float = 0.25
 # The MPC is built for a fixed human count (set on the first solve). We always
 # present exactly this many humans: the closest detected pedestrians, padded with
 # far-away inactive humans when fewer are seen.
@@ -73,21 +75,77 @@ _TIME_STEP: float = 0.50
 # Solve time grows steeply with this. On IPOPT/MUMPS (no HSL) the bilevel ORCA-KKT
 # solve is ~0.4s @2, ~1.1s @3, ~8s @5 — 5 is unusable. With HSL/MA57
 # (scripts/install_hsl.sh): ~0.19s @2, ~0.26s @3, ~0.40s @4, ~0.50s @5, ~0.69s @6.
-# 5 = SICNav's crowd operating point, run at _TIME_STEP=0.5 (2Hz) so the ~0.5s
-# solve matches the control period. campc.py caps the IPOPT wall-clock
-# (ipopt.max_cpu_time) so the occasional hard solve can't spike to multiple
-# seconds and make the robot drive blind. At _TIME_STEP=0.5 the per-step travel is
-# pref_speed*dt=0.45m, so horiz=4 already gives 1.8m lookahead (more than horiz=6
-# did at 0.25s) — no need for a long horizon. campc.py auto-detects MA57.
-_MAX_HUMANS: int = 5
+# WAS 5 @ _TIME_STEP=0.5 (SICNav's nominal crowd point) but at 5 humans the solve
+# (~0.5-0.6s) blew the 0.45s CPU cap ~99% of the time on the crossing scenario:
+# the MPC almost never returned a timely, trustworthy plan, so recovery/align took
+# over and the robot stalled+wiggled instead of negotiating past the crosser. 3 @
+# _TIME_STEP=0.25 solves ~0.26s -> converges within budget AND controls at 4Hz, so
+# the MPC actually drives the crossing. The MPC now models only the 3 CLOSEST
+# pedestrians; any others are still covered by the prediction-independent
+# _safety_brake(). campc.py caps the IPOPT wall-clock (ipopt.max_cpu_time, now
+# ~0.30s to bound the held action near the 0.25s step) so a hard solve can't spike
+# and drive the robot blind. campc.py auto-detects MA57.
+_MAX_HUMANS: int = 3
 _ROBOT_RADIUS: float = 0.3
 _HUMAN_RADIUS: float = 0.3
-_V_PREF: float = 0.9          # = pref_speed in policy.config
-_V_MAX: float = 0.95          # = max_speed in policy.config
-_OMEGA_MAX: float = math.radians(60.0) / _TIME_STEP  # = max_rot_degrees / dt
+_V_PREF: float = 0.3          # = pref_speed in policy.config
+_V_MAX: float = 0.35          # = max_speed in policy.config
+# Physical angular-rate cap = max_rot_degrees(per-step) / _TIME_STEP. max_rot_degrees
+# is a PER-STEP rotation bound on the MPC's action.r (mpc_env control bounds), so the
+# physical rate scales as 1/_TIME_STEP. Halving _TIME_STEP 0.5->0.25 would double the
+# rate to 240 deg/s for the same 60deg/step; we halved max_rot_degrees to 30 (in
+# policy.config) to KEEP the well-tuned ~120 deg/s. Keep these two in sync.
+_OMEGA_MAX: float = math.radians(30.0) / _TIME_STEP  # = max_rot_degrees / dt = ~120 deg/s
 _LOOKAHEAD: float = 3.0       # path lookahead for the MPC stabilisation point
 _HUMAN_GOAL_PROJ: float = 2.0  # seconds of constant-velocity goal projection
 _FAR: float = 1.0e3           # placement offset for padding humans
+# On a failed solve (no collision-checked trajectory) the recovery only creeps
+# forward if the closest pedestrian is beyond this; nearer than this it holds (v=0)
+# and waits for a converged solve, so a failure never drives at anyone.
+_RECOVERY_CLEAR_DIST: float = 2.0
+# Gentle turn-rate cap for failed-solve recovery when a pedestrian is near. The old
+# recovery turned at up to _OMEGA_MAX toward the (jittery, ped-avoidance) path
+# heading, which spun the robot in place at a crossing. When blocked we instead turn
+# slowly toward the STABLE goal bearing, capped here, so the robot holds and waits
+# for a gap facing roughly the goal rather than whirling.
+_REC_OMEGA_CAP: float = math.radians(45.0)
+# Reactive safety brake (prediction-INDEPENDENT). SICNav's MPC enforces collision
+# avoidance against its INTERNAL human prediction (reciprocal-ORCA + constant-velocity
+# goal projection). Arena's pedestrians move by social forces and do NOT avoid
+# reciprocally, so that prediction can be wrong and the MPC drives a "converged, safe"
+# trajectory straight through the real pedestrian (forced-crossing test: min 0.19m
+# center-to-center, well inside the 0.6m sum-of-radii; a 5x larger MPC keep-out margin
+# did not help -> it's the prediction, not the constraint). This brake is a hard safety
+# net ON TOP of the MPC, using MEASURED pedestrian positions/velocities only: scale the
+# commanded forward speed down as the robot CLOSES on the nearest pedestrian, to a full
+# stop at _BRAKE_STOP_DIST. It caps speed ONLY when the commanded motion reduces
+# clearance, so the robot resumes the moment the pedestrian passes or moves away.
+_BRAKE_SLOW_DIST: float = 1.5   # center-to-center distance at which to begin slowing
+_BRAKE_STOP_DIST: float = 0.8   # full stop (0.6m sum-of-radii + 0.2m margin)
+# Anti-freeze maneuver (_unfreeze): break a reciprocal deadlock when a social-force
+# pedestrian sits on the robot's path and SICNav's ORCA model keeps waiting for it to
+# yield. A freeze = commanded |v| < _FREEZE_V_EPS while the nearest ped is within
+# _FREEZE_PED_DIST; sustaining that for _FREEZE_TRIGGER steps escalates to a slow
+# creep at _GOAROUND_SPEED that FOLLOWS THE GLOBAL PLAN (peds imprint on the nav2
+# costmap, so navfn already routes the plan around them — verified live). The robot
+# steers toward the global-plan lookahead point (_GOAROUND_LOOKAHEAD ahead) and creeps
+# with a tighter _GOAROUND_STOP_DIST brake margin (still > 0.6m sum-of-radii). If a ped
+# is nearer than _GOAROUND_MIN_ARC_DIST in the travel direction (within _PATH_HALF_WIDTH
+# laterally) the robot is too close to move forward, so it first backs up — only if the
+# rear is clear of peds within _GOAROUND_REAR_CLEAR. The maneuver ends once no ped is
+# within _FREEZE_PED_DIST. Step counts derive from _TIME_STEP (4Hz).
+_FREEZE_V_EPS: float = 0.05
+_FREEZE_PED_DIST: float = 1.6
+_FREEZE_TRIGGER: int = max(1, round(3.0 / _TIME_STEP))   # ~3s frozen before escalating
+_GOAROUND_SPEED: float = 0.15
+_GOAROUND_LOOKAHEAD: float = 1.5                         # lookahead along the global plan
+_GOAROUND_FACE_TOL: float = math.radians(25.0)           # creep only when ~facing the aim
+_GOAROUND_STOP_DIST: float = 0.7                         # 0.6 sum-of-radii + 0.1 margin
+_GOAROUND_MIN_ARC_DIST: float = 1.0                      # nearer ahead than this -> back up first
+_GOAROUND_REAR_CLEAR: float = 0.9                        # rear must be clear within this to back up
+_PATH_HALF_WIDTH: float = 0.75                           # lateral half-width of the "blocking" corridor
+_frozen_steps: int = 0
+_goaround_active: bool = False
 # Heading error (rad) beyond which we rotate in place toward the target before
 # handing off to the MPC. SICNav's point-stabilisation MPC has a symmetric
 # zero-gradient equilibrium when the goal is ~180 deg behind the robot and stalls
@@ -102,6 +160,14 @@ _ALIGN_EXIT: float = math.radians(15.0)
 # Proportional turn rate: correct the heading error over ~this many seconds
 # (clamped to _OMEGA_MAX). Larger = gentler; avoids the overshoot of err/dt.
 _ALIGN_TC: float = 0.5
+# Suppress the in-place align spin when a pedestrian is within this distance. Near a
+# pedestrian, navfn re-routes around the moving ped every cycle, so the global-plan
+# lookahead heading (what align/recovery chase via _drive_heading_err) swings wildly
+# — at a crossing it swung ~110 deg and the robot rotated in place chasing it (the
+# "wiggle") instead of crossing, never letting the MPC drive. Within this radius we
+# skip the align spin and defer heading to the (fast, 4Hz) MPC, and the failed-solve
+# recovery turns toward the STABLE goal bearing rather than the jittery path heading.
+_ALIGN_PED_GATE: float = 2.0
 _aligning: bool = False
 # Key identifying the reference last generated (goal + whether it follows the plan);
 # regenerate when it changes.
@@ -114,7 +180,10 @@ _ALIGN_MIN_DIST: float = 0.6
 # POSITION but not the goal HEADING. Arena's goto-pose completion check also
 # requires the goal yaw (default tol 30 deg) — so once within this position
 # distance of the goal, rotate in place to the goal yaw so arrival registers.
-_GOAL_POS_TOL: float = 0.5
+# Must be < the task_generator goal_radius (default 0.3m, staged/impl.py) or the
+# robot declares "at goal" and stops driving while still outside the scoring
+# circle, so the episode never completes (same goal re-published forever).
+_GOAL_POS_TOL: float = 0.25
 _GOAL_YAW_TOL: float = math.radians(12.0)
 
 _policy: CollisionAvoidMPC | None = None
@@ -254,6 +323,158 @@ def _build_plan_reference(policy: CollisionAvoidMPC, joint_state, plan) -> bool:
     return True
 
 
+def _drive_heading_err(global_plan, robot_pose, goal_xy) -> float:
+    """Heading error (rad) from the robot to the direction it SHOULD drive: the
+    global-plan lookahead point if a plan is available, else the straight-line goal.
+
+    The rotate-to-align step and the failed-solve recovery both use this. Aligning to
+    the PATH lookahead heading (what the path_foll MPC tracks) rather than the goal
+    bearing is what stops them thrashing: when navfn's route initially leaves on a
+    different bearing than robot->goal, aligning to the goal would point the robot off
+    the path, the MPC would immediately steer back onto it, and the rotate step would
+    re-fire — in-place rotation cycling against forward motion."""
+    rx, ry, th = float(robot_pose[0]), float(robot_pose[1]), float(robot_pose[2])
+    tx, ty = goal_xy
+    if global_plan is not None and len(global_plan) >= 2:
+        la = lookahead_on_path(
+            np.asarray(global_plan, dtype=float), np.asarray(robot_pose, dtype=float), _LOOKAHEAD
+        )
+        if la is not None:
+            tx, ty = la
+    return (math.atan2(ty - ry, tx - rx) - th + math.pi) % (2 * math.pi) - math.pi
+
+
+def _safety_brake(v: float, robot_pose, humans,
+                  slow_dist: float = _BRAKE_SLOW_DIST,
+                  stop_dist: float = _BRAKE_STOP_DIST) -> float:
+    """Prediction-independent reactive speed cap (see the _BRAKE_* constants).
+
+    Reduce the commanded forward speed as the robot closes on the nearest MEASURED
+    pedestrian, to a full stop at stop_dist. This is a hard safety net beneath
+    SICNav's MPC, which only avoids its internal (reciprocal-ORCA) human prediction and
+    can therefore drive a converged trajectory through a real social-force pedestrian.
+
+    Only the robot's OWN approach is braked: speed is capped only when the commanded
+    motion would reduce clearance to a pedestrian (closing speed > 0), so the robot
+    proceeds again as soon as the pedestrian crosses past or moves away. Uses measured
+    positions/velocities only — completely independent of the MPC's prediction.
+
+    slow_dist/stop_dist default to the cruise margins; the deliberate go-around
+    maneuver (_unfreeze) passes a tighter stop_dist so it can pass a path-blocking
+    pedestrian at a closer (but still > sum-of-radii) tangential clearance."""
+    if v <= 0.0:
+        return v  # reversing / already stopped never drives forward into a human
+    rx, ry, th = float(robot_pose[0]), float(robot_pose[1]), float(robot_pose[2])
+    vrx, vry = v * math.cos(th), v * math.sin(th)
+    v_cap = _V_MAX
+    engaged: tuple[float, float] | None = None
+    for h in humans:
+        dx, dy = float(h.px) - rx, float(h.py) - ry
+        d = math.hypot(dx, dy)
+        if d >= slow_dist:
+            continue
+        nx, ny = dx / d, dy / d
+        # Closing speed of the robot onto this human: n.(v_robot - v_human), where n
+        # points robot->human. >0 means the commanded motion is reducing clearance.
+        # Gate the whole brake (including the hard stop) on closing>0: a pedestrian
+        # the robot is moving AWAY from (e.g. behind it, or one it has just passed)
+        # must NOT hard-stop forward motion — otherwise a ped lingering within
+        # stop_dist behind the robot freezes it even though driving on is safe.
+        closing = (vrx - float(h.vx)) * nx + (vry - float(h.vy)) * ny
+        if closing <= 0.0:
+            continue
+        if d <= stop_dist:
+            v_cap, engaged = 0.0, (d, 0.0)
+            break
+        cap = (d - stop_dist) / (slow_dist - stop_dist) * _V_MAX
+        if cap < v_cap:
+            v_cap, engaged = cap, (d, cap)
+    if engaged is not None and v_cap < v:
+        _dbg(f"SAFETY BRAKE: v {v:.3f} -> {v_cap:.3f} (nearest engaged d={engaged[0]:.2f})")
+        return v_cap
+    return v
+
+
+def _unfreeze(v: float, omega: float, robot_pose, humans, goal_xy, global_plan) -> list[float]:
+    """Deadlock-breaking maneuver (prediction-independent, beneath the MPC).
+
+    SICNav's ORCA human model assumes pedestrians reciprocally avoid, so when a
+    social-force pedestrian instead sits on the robot's path the MPC (and the safety
+    brake) hold the robot at a standstill expecting it to move — they mutually freeze
+    and the robot never reaches its goal. This detects a SUSTAINED freeze (commanded
+    ~0 while a ped is close) and escalates to a slow creep that FOLLOWS THE GLOBAL
+    PLAN. Pedestrians imprint as lethal obstacles (lidar) with inflation on the nav2
+    costmap, so navfn already routes the global plan around them — verified live:
+    ped cells read 100 in both obstacle_layer and global_costmap. The deadlock is
+    purely that the local MPC won't execute that already-safe route. So when blocked
+    we steer toward the global-plan lookahead point and creep along it with a tighter
+    (still > sum-of-radii) brake margin. If a ped is too close in the travel direction
+    to move forward, back up first (when the rear is clear) to open room. Normal
+    momentary yielding is untouched (only freezes past _FREEZE_TRIGGER escalate); the
+    maneuver ends once no ped is within _FREEZE_PED_DIST."""
+    global _frozen_steps, _goaround_active
+    rx, ry, th = float(robot_pose[0]), float(robot_pose[1]), float(robot_pose[2])
+
+    nearest = min((math.hypot(float(h.px) - rx, float(h.py) - ry) for h in humans), default=_FAR)
+    if nearest > _FREEZE_PED_DIST:
+        # Fully clear -> normal command; reset state (this is also the maneuver exit).
+        _frozen_steps = 0
+        _goaround_active = False
+        return [v, omega]
+
+    if not _goaround_active:
+        # Count consecutive stopped-AND-near-a-ped steps; escalate past the trigger.
+        if abs(v) < _FREEZE_V_EPS:
+            _frozen_steps += 1
+        else:
+            _frozen_steps = 0
+        if _frozen_steps < _FREEZE_TRIGGER:
+            return [v, omega]
+        _goaround_active = True
+        _dbg(f"UNFREEZE: escalating (frozen {_frozen_steps} steps, nearest={nearest:.2f})")
+
+    # --- active maneuver: steer along the global plan (already routed around peds) --
+    aim = math.atan2(goal_xy[1] - ry, goal_xy[0] - rx)  # fallback: straight at goal
+    if global_plan is not None and len(global_plan) >= 2:
+        la = lookahead_on_path(
+            np.asarray(global_plan, dtype=float), np.asarray(robot_pose, dtype=float),
+            _GOAROUND_LOOKAHEAD,
+        )
+        if la is not None:
+            aim = math.atan2(la[1] - ry, la[0] - rx)
+    ax, ay = math.cos(aim), math.sin(aim)
+    herr = (aim - th + math.pi) % (2 * math.pi) - math.pi
+
+    # Ped too close in the travel (aim) direction to move forward? Back up to open
+    # room first — but only if the rear (opposite the aim) is clear, else we'd reverse
+    # into someone. Rotate toward the aim while backing so we're oriented to drive out.
+    blocker_d = _FAR
+    for h in humans:
+        dx, dy = float(h.px) - rx, float(h.py) - ry
+        d = math.hypot(dx, dy)
+        if d <= _FREEZE_PED_DIST and (dx * ax + dy * ay) > 0.0 and abs(dx * -ay + dy * ax) < _PATH_HALF_WIDTH:
+            blocker_d = min(blocker_d, d)
+    if blocker_d < _GOAROUND_MIN_ARC_DIST:
+        rear_clear = all(
+            not (math.hypot(float(h.px) - rx, float(h.py) - ry) <= _GOAROUND_REAR_CLEAR
+                 and ((float(h.px) - rx) * ax + (float(h.py) - ry) * ay) < 0.0)
+            for h in humans
+        )
+        if rear_clear:
+            bk_omega = float(np.clip(herr / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
+            _dbg(f"UNFREEZE: backing up to open room (blocker_d={blocker_d:.2f}) "
+                 f"[v={-_GOAROUND_SPEED:.3f}, omega={bk_omega:.3f}]")
+            return [-_GOAROUND_SPEED, bk_omega]
+        _dbg(f"UNFREEZE: sandwiched (blocker_d={blocker_d:.2f}, rear blocked) -> hold")
+
+    ga_omega = float(np.clip(herr / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
+    ga_v = _GOAROUND_SPEED if abs(herr) < _GOAROUND_FACE_TOL else 0.0
+    ga_v = _safety_brake(ga_v, robot_pose, humans, stop_dist=_GOAROUND_STOP_DIST)
+    _dbg(f"UNFREEZE: follow-plan [v={ga_v:.3f}, omega={ga_omega:.3f}] "
+         f"(aim={aim:.2f} herr={herr:.2f} nearest={nearest:.2f} blocker_d={blocker_d:.2f})")
+    return [ga_v, ga_omega]
+
+
 def step(features: dict) -> list[float]:
     global _policy
     if _policy is None:
@@ -302,12 +523,21 @@ def step(features: dict) -> list[float]:
         _dbg("at goal pose -> [0,0]")
         return [0.0, 0.0]
 
+    robot = _robot_full_state(robot_pose, robot_state, goal_xy)
+    humans = _human_states(features.get("pedestrians"), (rx, ry))
+    joint_state = FullyObservableJointState(self_state=robot, human_states=humans, static_obs=[])
+    nearest_hum = min((math.hypot(h.px - rx, h.py - ry) for h in humans), default=_FAR)
+
     # Unicycle alignment: rotate in place to face the goal before driving, so the
     # MPC starts well-aligned. Hysteretic + proportional (turns cleanly then hands
-    # off). Pure rotation, no translation, so it's safe around humans.
+    # off). Pure rotation, no translation, so it's safe around humans. GATED on
+    # pedestrian proximity (_ALIGN_PED_GATE): within that radius the global-plan
+    # lookahead heading swings as navfn re-routes around the moving ped, so chasing
+    # it spins the robot in place (the crossing "wiggle"); there we skip align and
+    # let the MPC drive the crossing directly.
     global _aligning
-    heading_err = (math.atan2(goal_xy[1] - ry, goal_xy[0] - rx) - theta + math.pi) % (2 * math.pi) - math.pi
-    if _ALIGN_ENTER > 0.0:
+    heading_err = _drive_heading_err(global_plan, robot_pose, goal_xy)
+    if _ALIGN_ENTER > 0.0 and nearest_hum > _ALIGN_PED_GATE:
         if _aligning:
             _aligning = abs(heading_err) > _ALIGN_EXIT
         elif abs(heading_err) > _ALIGN_ENTER:
@@ -316,10 +546,8 @@ def step(features: dict) -> list[float]:
             omega = float(np.clip(heading_err / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
             _dbg(f"align: heading_err={heading_err:.2f} -> rotate [0, {omega:.3f}]")
             return [0.0, omega]
-
-    robot = _robot_full_state(robot_pose, robot_state, goal_xy)
-    humans = _human_states(features.get("pedestrians"), (rx, ry))
-    joint_state = FullyObservableJointState(self_state=robot, human_states=humans, static_obs=[])
+    else:
+        _aligning = False  # don't carry align state into a near-ped encounter
 
     # path_foll reference: prefer the Arena global plan (navfn's obstacle-avoiding
     # route); fall back to SICNav's straight-line gen_ref_traj until a plan for the
@@ -381,15 +609,59 @@ def step(features: dict) -> list[float]:
     dist_goal = math.hypot(goal_xy[0] - rx, goal_xy[1] - ry)
     _dbg(f"action raw v={action.v:.4f} r={action.r:.4f} solved={solved} status={status} iters={iters} "
          f"why={dtext!r} solve_s={solve_s:.3f} dist_goal={dist_goal:.2f} -> [v={v:.4f}, omega={omega:.4f}]")
-    return [v, omega]
+
+    # A non-converged solve (status not in {Solved=2, Acceptable=1} — e.g. -5
+    # Maximum_CpuTime_Exceeded on a hard bilevel config) makes CAMPC return its
+    # warmstart GUESS, whose first control is typically a SATURATED spin
+    # (|omega| -> _OMEGA_MAX at ~half speed). Forwarding that whirls the robot in
+    # place — the "robot does 360s" failure mode — so don't trust a failed solve.
+    # SAFETY: with no collision-checked trajectory, never creep toward a nearby ped.
+    solve_ok = isinstance(status, int) and status in (1, 2)
+    if not solve_ok:
+        clear = nearest_hum > _RECOVERY_CLEAR_DIST
+        if clear:
+            # Open space: align to the path lookahead (what path_foll tracks) and
+            # creep forward once well-aligned, so a run of failures walks the robot
+            # out of the hard config toward the goal (changing the geometry so the
+            # next solve converges) instead of spinning.
+            rerr = _drive_heading_err(global_plan, robot_pose, goal_xy)
+            rec_v = 0.25 if abs(rerr) < _ALIGN_EXIT else 0.0
+            rec_omega = float(np.clip(rerr / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
+        else:
+            # Near a ped (e.g. at a crossing): the path lookahead heading swings as
+            # navfn re-routes around the moving ped, so chasing it spins the robot in
+            # place. Hold position (v=0) and turn GENTLY toward the STABLE goal
+            # bearing (capped at _REC_OMEGA_CAP) so the robot waits for a gap facing
+            # roughly the goal, ready to drive once a solve converges, rather than
+            # whirling. Turning in place never reduces clearance.
+            rerr = (math.atan2(goal_xy[1] - ry, goal_xy[0] - rx) - theta + math.pi) % (2 * math.pi) - math.pi
+            rec_v = 0.0
+            rec_omega = float(np.clip(rerr / _ALIGN_TC, -_REC_OMEGA_CAP, _REC_OMEGA_CAP))
+        _dbg(f"solve NOT converged (status={status}) -> recovery [v={rec_v}, omega={rec_omega:.3f}] "
+             f"(nearest_hum={nearest_hum:.2f} clear={clear} rerr={rerr:.2f}; discarded raw omega={omega:.3f})")
+        # A sustained failed-solve hold next to a ped is itself a freeze; let the
+        # go-around escalate out of it instead of waiting forever for a solve.
+        return _unfreeze(rec_v, rec_omega, robot_pose, humans, goal_xy, global_plan)
+
+    # Reactive safety brake (prediction-independent final guard): even on a converged
+    # solve the MPC may have planned through a real pedestrian its internal model
+    # mispredicted, so cap forward speed using measured pedestrian proximity/closing.
+    # omega is preserved so the robot can still steer away while slowing/stopped.
+    v = _safety_brake(v, robot_pose, humans)
+    # Deadlock-breaking go-around: if a ped camps on the path and the (braked) MPC
+    # command stays frozen, escalate to a slow lateral pass; otherwise pass through.
+    return _unfreeze(v, omega, robot_pose, humans, goal_xy, global_plan)
 
 
 def on_reset(episode_id: str, initial_state: dict | None) -> None:
     # Rebuild the MPC for the next episode (re-fixes human count, resets warmstart).
     global _policy, _aligning, _last_ref_key
+    global _frozen_steps, _goaround_active
     _policy = None
     _aligning = False
     _last_ref_key = None
+    _frozen_steps = 0
+    _goaround_active = False
 
 
 if __name__ == "__main__":

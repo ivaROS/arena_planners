@@ -26,7 +26,11 @@ import sys
 
 MARKER = "ipopt.max_cpu_time"
 ANCHOR = "opti.solver('ipopt', opts)"
-DEFAULT_MAX_CPU_TIME = 0.45
+# 0.30s: bounds the held action near the _TIME_STEP=0.25 control period (planner.py)
+# at _MAX_HUMANS=3 (typical MA57 solve ~0.26s). Was 0.45 for the old 5-human/0.5s
+# operating point. Keep this just above the typical solve so solves converge but
+# pathological ones can't spike and drive the robot blind.
+DEFAULT_MAX_CPU_TIME = 0.30
 
 
 def main() -> int:

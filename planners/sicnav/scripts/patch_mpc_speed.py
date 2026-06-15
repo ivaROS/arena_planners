@@ -40,10 +40,19 @@ MARKER = "[Arena port patch] cruise-speed"
 # diagonal (the robot's v_prev state) is currently 0 -> velocity is not tracked.
 ANCHOR = "self.Q = cs.sparsify(np.diag(np.hstack([np.ones(2), np.zeros(self.nx_r-2+self.np_g+self.nx_hum*self.num_hums)])))"
 DEFAULT_VELOCITY_WEIGHT = 2.0
+# Heading (theta) is Q index 2, also 0 upstream. With position-only tracking the
+# unicycle has no heading reference, so on the navfn path it corrects lateral offset
+# by swinging heading and, at the coarse dt=0.5 control period, overshoots to the
+# other side -> a left/right heading limit cycle ("can't drive straight"). The
+# reference already carries a smooth windowed path heading (ref_X row 2); weighting
+# it makes the MPC track that heading and damps the oscillation (large omega
+# reversals ~17% -> ~5%).
+DEFAULT_HEADING_WEIGHT = 2.0
 
 
 def main() -> int:
     w_v = float(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_VELOCITY_WEIGHT
+    w_th = float(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_HEADING_WEIGHT
 
     spec = importlib.util.find_spec("sicnav.utils.mpc_utils.mpc_env")
     if spec is None or not spec.origin:
@@ -67,13 +76,14 @@ def main() -> int:
     for line in lines:
         if ANCHOR in line:
             indent = line[: len(line) - len(line.lstrip())]
-            out.append(f"{indent}# {MARKER}: weight the robot velocity state (Q index 3) so the\n")
-            out.append(f"{indent}# MPC tracks the pref_speed already present in the reference and the\n")
-            out.append(f"{indent}# non-convex solve doesn't settle into a slow warmstart local min.\n")
-            out.append(f"{indent}# See scripts/patch_mpc_speed.py. Re-applied on each build.\n")
+            out.append(f"{indent}# {MARKER}: weight the robot heading (Q index 2) and velocity\n")
+            out.append(f"{indent}# (index 3) states. Upstream tracks x/y position only, which makes the\n")
+            out.append(f"{indent}# robot crawl (velocity not tracked) and oscillate left/right (no heading\n")
+            out.append(f"{indent}# reference -> lateral correction overshoots at the coarse dt). Both targets\n")
+            out.append(f"{indent}# are already in the reference. See scripts/patch_mpc_speed.py; re-applied each build.\n")
             out.append(
                 f"{indent}self.Q = cs.sparsify(np.diag(np.hstack(["
-                f"np.ones(2), np.array([0.0, {w_v}]), "
+                f"np.ones(2), np.array([{w_th}, {w_v}]), "
                 f"np.zeros(self.np_g+self.nx_hum*self.num_hums)])))\n"
             )
         else:
@@ -81,7 +91,7 @@ def main() -> int:
 
     with open(path, "w") as fh:
         fh.write("".join(out))
-    print(f"[patch_mpc_speed] applied velocity_weight={w_v} to Q in {path}")
+    print(f"[patch_mpc_speed] applied heading_weight={w_th}, velocity_weight={w_v} to Q in {path}")
     return 0
 
 
