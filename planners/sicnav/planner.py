@@ -155,7 +155,24 @@ _goaround_active: bool = False
 # prevents the align step and the MPC from fighting (which made the robot spin in
 # place): the robot turns cleanly to face the target, then the MPC drives.
 # Set _ALIGN_ENTER to 0 to disable and use the MPC unconditionally.
+# align is a STALL-BREAKER, not a steering method: it does the crisp initial turn (robot
+# spawns stopped, e.g. ~99deg off the corridor) -- far better than the short-horizon MPC,
+# which on big turns turns-in-place / reverses / blows its CPU cap (status=-5) -- then
+# hands steering to the MPC. The "don't steer mid-drive" rule is enforced by a per-goal
+# LATCH (see _align_used), NOT by a speed gate: gating on measured speed was tried and
+# FAILED because odom velocity lags badly (reads ~0.07 m/s when commanded ~0.3), so the
+# gate never closed. Threshold kept at 60deg; the latch (not a high angle) is what
+# prevents the turn->drive->turn-back RE-TRIGGER that was the visible "wiggle".
 _ALIGN_ENTER: float = math.radians(60.0)
+# Per-goal latch: align does at most ONE crisp turn per goal (the initial turn from a
+# stop), then hands steering to the MPC and does NOT re-pivot mid-traverse -- this kills
+# the turn->drive->turn-back RE-TRIGGER that is the visible "wiggle" when following a
+# decent plan whose lookahead stays off the robot's heading around corridor bends.
+# (Gating on measured speed was tried and FAILED: odom velocity lags badly -- reads
+# ~0.07 m/s even when commanded ~0.3 -- so a speed gate never closes.) The latch resets
+# on a goal change. It is OVERRIDDEN above _ALIGN_HARD so a genuine re-stall facing
+# nearly backward (the symmetric point-stab equilibrium) can still be broken.
+_ALIGN_HARD: float = math.radians(135.0)
 _ALIGN_EXIT: float = math.radians(15.0)
 # Proportional turn rate: correct the heading error over ~this many seconds
 # (clamped to _OMEGA_MAX). Larger = gentler; avoids the overshoot of err/dt.
@@ -169,6 +186,10 @@ _ALIGN_TC: float = 0.5
 # recovery turns toward the STABLE goal bearing rather than the jittery path heading.
 _ALIGN_PED_GATE: float = 2.0
 _aligning: bool = False
+# Per-goal align latch (see _ALIGN_HARD): the rounded goal align last fired for, and
+# whether it has already fired for that goal. Reset on goal change / on_reset.
+_align_goal_key: tuple | None = None
+_align_used: bool = False
 # Key identifying the reference last generated (goal + whether it follows the plan);
 # regenerate when it changes.
 _last_ref_key: tuple | None = None
@@ -185,6 +206,28 @@ _ALIGN_MIN_DIST: float = 0.6
 # circle, so the episode never completes (same goal re-published forever).
 _GOAL_POS_TOL: float = 0.25
 _GOAL_YAW_TOL: float = math.radians(12.0)
+
+# Pure-pursuit path follower for OPEN space. SICNav's bilevel MPC is a crowd-avoidance
+# controller; in clear corridors it is overkill and, at the affordable horizon (horiz=4),
+# does not track a path smoothly -- it turns in place and its omega is a sign-flipping
+# limit-cycle (the residual "wiggle"). So when NO pedestrian is near and a usable global
+# plan exists, drive the plan with a plain pure-pursuit arc (like RPP/DWB); hand control
+# to the SICNav MPC only when a pedestrian comes near, where its reciprocal crowd
+# negotiation is the whole point. Hysteresis on the ped distance avoids controller
+# flip-flop at the boundary.
+# Engagement is PATH-AWARE, not a bare radius: a corridor can be LINED with pedestrians
+# (e.g. 5 peds ~2.6m away against the walls) that navfn has already routed the plan clear
+# of -- those must NOT pull in the MPC, or it never lets go. The MPC engages only when a
+# ped is AHEAD of the robot and within the travel lane (_PP_PATH_HALF_WIDTH) -- i.e.
+# actually blocking -- within _PP_PED_ENTER (hysteresis: stays engaged out to _PP_PED_EXIT).
+_PP_PED_ENTER: float = 3.0    # a ped blocking the lane within this -> switch to SICNav MPC
+_PP_PED_EXIT: float = 3.5     # ... stay on MPC until no blocking ped within this
+_PP_PATH_HALF_WIDTH: float = 0.8  # lateral half-width (m) of the "blocking" lane (~sum-radii+margin)
+_PP_LOOKAHEAD: float = 1.2    # lookahead distance along the plan (m)
+_PP_TC: float = 0.7           # steering time-constant: omega = alpha / _PP_TC (clipped)
+_PP_SLOW_ANGLE: float = math.radians(90.0)  # taper speed to the floor by this heading err
+_PP_VMIN_FRAC: float = 0.25   # min speed fraction -> keep arcing, never pivot in place
+_use_mpc: bool = False        # hysteretic controller-selection latch
 
 _policy: CollisionAvoidMPC | None = None
 
@@ -321,6 +364,46 @@ def _build_plan_reference(policy: CollisionAvoidMPC, joint_state, plan) -> bool:
     policy.ref_poses_all = ref_x
     policy.ref_actions_all = ref_u
     return True
+
+
+def _ped_blocking_lane(humans, robot_pose, reach: float) -> bool:
+    """True if a real pedestrian is AHEAD of the robot and within its travel lane
+    (|lateral| < _PP_PATH_HALF_WIDTH) within ``reach`` metres -- i.e. actually obstructing,
+    so the SICNav MPC's crowd negotiation is warranted. Pedestrians beside the corridor
+    (already routed clear by navfn) or behind the robot do NOT count, so the smooth
+    pure-pursuit follower keeps control. Padding humans sit at _FAR, beyond any reach."""
+    rx, ry, th = float(robot_pose[0]), float(robot_pose[1]), float(robot_pose[2])
+    fx, fy = math.cos(th), math.sin(th)
+    for h in humans:
+        dx, dy = float(h.px) - rx, float(h.py) - ry
+        if math.hypot(dx, dy) > reach:
+            continue
+        fwd = dx * fx + dy * fy                # signed forward distance
+        lat = abs(-dx * fy + dy * fx)          # lateral offset from the heading line
+        if fwd > -0.3 and lat < _PP_PATH_HALF_WIDTH:
+            return True
+    return False
+
+
+def _pure_pursuit(global_plan, robot_pose, humans) -> list[float] | None:
+    """Plain pure-pursuit arc toward a lookahead point on the global plan (open-space
+    path follower; used only when no pedestrian is near — see the _PP_* constants).
+
+    Steers proportionally toward the lookahead point and tapers speed for sharp turns
+    while keeping a forward-progress floor, so it ARCS like a normal path follower
+    instead of pivoting in place. The reactive _safety_brake is still applied as a net.
+    Returns None if no lookahead point can be found (caller then falls back to the MPC)."""
+    rx, ry, th = float(robot_pose[0]), float(robot_pose[1]), float(robot_pose[2])
+    la = lookahead_on_path(
+        np.asarray(global_plan, dtype=float), np.asarray(robot_pose, dtype=float), _PP_LOOKAHEAD
+    )
+    if la is None:
+        return None
+    alpha = (math.atan2(float(la[1]) - ry, float(la[0]) - rx) - th + math.pi) % (2 * math.pi) - math.pi
+    omega = float(np.clip(alpha / _PP_TC, -_OMEGA_MAX, _OMEGA_MAX))
+    v = _V_PREF * float(np.clip(1.0 - abs(alpha) / _PP_SLOW_ANGLE, _PP_VMIN_FRAC, 1.0))
+    v = _safety_brake(v, robot_pose, humans)
+    return [v, omega]
 
 
 def _drive_heading_err(global_plan, robot_pose, goal_xy) -> float:
@@ -528,6 +611,26 @@ def step(features: dict) -> list[float]:
     joint_state = FullyObservableJointState(self_state=robot, human_states=humans, static_obs=[])
     nearest_hum = min((math.hypot(h.px - rx, h.py - ry) for h in humans), default=_FAR)
 
+    # Controller arbitration (see the _PP_* constants): in OPEN space (no pedestrian
+    # near) with a usable global plan, follow the plan with a plain pure-pursuit arc --
+    # SICNav's MPC wiggles there. Hand to the MPC (the align + predict path below) only
+    # when a pedestrian is near, where its crowd avoidance is the point. Hysteretic so
+    # the two controllers don't flip-flop at the boundary.
+    global _use_mpc
+    _use_mpc = _ped_blocking_lane(humans, robot_pose, _PP_PED_EXIT if _use_mpc else _PP_PED_ENTER)
+    plan_usable = (
+        global_plan is not None and len(global_plan) >= 2
+        and math.hypot(
+            float(np.asarray(global_plan)[-1][0]) - goal_xy[0],
+            float(np.asarray(global_plan)[-1][1]) - goal_xy[1],
+        ) < 1.0
+    )
+    if plan_usable and not _use_mpc:
+        cmd = _pure_pursuit(global_plan, robot_pose, humans)
+        if cmd is not None:
+            _dbg(f"pure-pursuit (nearest_hum={nearest_hum:.2f}) -> [v={cmd[0]:.4f}, omega={cmd[1]:.4f}]")
+            return cmd
+
     # Unicycle alignment: rotate in place to face the goal before driving, so the
     # MPC starts well-aligned. Hysteretic + proportional (turns cleanly then hands
     # off). Pure rotation, no translation, so it's safe around humans. GATED on
@@ -535,16 +638,36 @@ def step(features: dict) -> list[float]:
     # lookahead heading swings as navfn re-routes around the moving ped, so chasing
     # it spins the robot in place (the crossing "wiggle"); there we skip align and
     # let the MPC drive the crossing directly.
-    global _aligning
+    global _aligning, _align_goal_key, _align_used
     heading_err = _drive_heading_err(global_plan, robot_pose, goal_xy)
+    # Reset the per-goal latch when the goal changes, so each new goal gets one turn.
+    _gk = (round(goal_xy[0], 1), round(goal_xy[1], 1))
+    if _gk != _align_goal_key:
+        _align_goal_key = _gk
+        _align_used = False
+    # Gate align ENTRY on the direct GOAL bearing, not just the path-lookahead heading.
+    # The shim exists to break the startup case where the goal/path genuinely leaves
+    # BEHIND the robot; it must NOT fire merely because navfn's plan WEAVES (the 3m
+    # lookahead swings >60deg) around pedestrians/obstacles that are AHEAD while the
+    # goal itself is straight ahead. That false trigger pinned the robot in a v=0
+    # in-place pivot for tens of steps at a time (the corridor "wiggle": ~37% of
+    # decisions were align, in bursts up to ~270 steps) instead of letting the MPC --
+    # which models those agents as ORCA-KKT constraints -- drive through. We still
+    # ROTATE toward the path-lookahead heading (heading_err) once engaged, to avoid the
+    # off-path thrash that aligning to the goal bearing caused (see _drive_heading_err),
+    # but only ENTER when the goal bearing is also off-heading. Exit is unchanged so an
+    # engaged turn still completes cleanly via hysteresis.
+    goal_bearing_err = (math.atan2(goal_xy[1] - ry, goal_xy[0] - rx) - theta + math.pi) % (2 * math.pi) - math.pi
     if _ALIGN_ENTER > 0.0 and nearest_hum > _ALIGN_PED_GATE:
         if _aligning:
             _aligning = abs(heading_err) > _ALIGN_EXIT
-        elif abs(heading_err) > _ALIGN_ENTER:
+        elif (abs(heading_err) > _ALIGN_ENTER and abs(goal_bearing_err) > _ALIGN_ENTER
+              and (not _align_used or abs(heading_err) > _ALIGN_HARD)):
             _aligning = True
+            _align_used = True  # latch: at most one align burst per goal (unless re-stall)
         if _aligning:
             omega = float(np.clip(heading_err / _ALIGN_TC, -_OMEGA_MAX, _OMEGA_MAX))
-            _dbg(f"align: heading_err={heading_err:.2f} -> rotate [0, {omega:.3f}]")
+            _dbg(f"align: heading_err={heading_err:.2f} goal_err={goal_bearing_err:.2f} -> rotate [0, {omega:.3f}]")
             return [0.0, omega]
     else:
         _aligning = False  # don't carry align state into a near-ped encounter
@@ -657,11 +780,15 @@ def on_reset(episode_id: str, initial_state: dict | None) -> None:
     # Rebuild the MPC for the next episode (re-fixes human count, resets warmstart).
     global _policy, _aligning, _last_ref_key
     global _frozen_steps, _goaround_active
+    global _align_goal_key, _align_used, _use_mpc
     _policy = None
     _aligning = False
     _last_ref_key = None
     _frozen_steps = 0
     _goaround_active = False
+    _align_goal_key = None
+    _align_used = False
+    _use_mpc = False
 
 
 if __name__ == "__main__":
