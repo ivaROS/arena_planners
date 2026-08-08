@@ -166,6 +166,20 @@ class PlannerEdgeNode(ArenaMixinNode):
         # Harmless for fast NN planners (drlvo/crowdnav) whose solves are << 0.5s.
         self._action_timeout = self.ROSParam[float]("planner_action_timeout_s", 0.8)
         self._init_timeout = self.ROSParam[float]("planner_init_timeout_s", 60.0)
+        # Reset/Cancel round-trip budget; was hardcoded 5.0s, now tunable.
+        # OBSERVED (SICNav, n_envs=2, 2026-08-08): reset round-trips are bimodal
+        # — normally 2-4s, but ~12% of them never get a ResetAck at all. Raising
+        # the budget to 30s did NOT convert those into successes (rate stayed
+        # ~7-15%), it only made each failure burn 30s instead of 5s, costing
+        # ~18% of training wall-clock. So keep it SHORT: the failure mode is
+        # "ack never arrives", not "ack is slow", and failing fast is strictly
+        # cheaper. Each failure costs one degenerate 1-step episode
+        # (~0.25% of transitions — negligible for learning).
+        # Root cause NOT yet identified. Ruled out: slow first solve (raising
+        # the timeout didn't help), CPU starvation from orphaned planner
+        # processes (persists on an idle machine), and per-episode MPC rebuild
+        # (`_build_policy()` measured at 0.00s — CollisionAvoidMPC is lazy).
+        self._ack_timeout = self.ROSParam[float]("planner_ack_timeout_s", 5.0)
         self._dropped_features_logged: set[str] = set()
 
     # ------------------------------------------------------------------
@@ -386,7 +400,7 @@ class PlannerEdgeNode(ArenaMixinNode):
         """Send Cancel and await CancelAck."""
         assert self._push is not None
         self._push.send_frame(encode_frame(Cancel()))
-        frame = await self._drain_until(CancelAck, timeout=5.0)
+        frame = await self._drain_until(CancelAck, timeout=self._ack_timeout.value)
         if not isinstance(frame, CancelAck):
             raise ProtocolError(f"expected cancel_ack, got {frame!r}")
 
@@ -399,7 +413,7 @@ class PlannerEdgeNode(ArenaMixinNode):
         assert self._push is not None
         t_before = self.sim_time
         self._push.send_frame(encode_frame(Reset(episode_id=episode_id, initial_state=initial_state)))
-        frame = await self._drain_until(ResetAck, timeout=5.0)
+        frame = await self._drain_until(ResetAck, timeout=self._ack_timeout.value)
         if not isinstance(frame, ResetAck):
             raise ProtocolError(f"expected reset_ack, got {frame!r}")
         t_after = self.sim_time
